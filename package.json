@@ -3,6 +3,12 @@
   "displayName": "Git Pinned Commit Highlighter",
   "description": "Highlights file changes compared to a pinned Git commit directly in the editor.",
   "version": "0.0.1",
+  "publisher": "mashurr",
+  "icon": "icon.png",
+    "repository": {
+      "type": "git",
+      "url": "https://github.com/mashurr/git-pinned-commit-highlighter.git"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
