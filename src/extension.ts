@@ -1,282 +1,194 @@
 import * as vscode from 'vscode';
-import { execSync } from 'child_process';
+import * as path from 'path';
+import type { API as GitAPI, GitExtension, Repository } from './git';
 
-interface Decorations {
-    modified: vscode.TextEditorDecorationType;
-    added: vscode.TextEditorDecorationType;
-    removed: vscode.TextEditorDecorationType;
+const TOGGLE_COMMAND = 'pinned-commit-highlighter.togglePinnedCommit';
+const REF_PLACEHOLDER = 'e.g., main, origin/develop, a1b2c3d, HEAD~2';
+// Empty documents that files added since the pinned ref are compared against
+const EMPTY_SCHEME = 'pinned-commit-empty';
+
+let pinnedRef: string | undefined;
+let statusBarItem: vscode.StatusBarItem;
+// One source control per repository root. VS Code draws each one's quick diff in the
+// gutter the same way as Git's own changes, so it never takes the breakpoint column.
+const pinnedDiffs = new Map<string, vscode.SourceControl>();
+
+/** The built-in Git extension's API, or undefined when it is disabled. */
+async function getGitAPI(): Promise<GitAPI | undefined> {
+    const extension = vscode.extensions.getExtension<GitExtension>('vscode.git');
+    if (!extension) {
+        return undefined;
+    }
+    const git = extension.isActive ? extension.exports : await extension.activate();
+    return git.enabled ? git.getAPI(1) : undefined;
 }
 
-interface DiffLines {
-    modified: number[];
-    added: number[];
-    removed: number[];
-}
-
-let pinnedCommitSha: string | null = null;
-let statusBarItem: vscode.StatusBarItem | undefined;
-let decorations: Decorations | undefined;
-
-/**
- * Gets git diff for a file compared to HEAD or pinned reference
- */
-function getGitDiff(filePath: string): string {
+async function hasRef(repository: Repository, ref: string): Promise<boolean> {
     try {
-        const compareTarget = pinnedCommitSha || 'HEAD';
-        const diff = execSync(`git diff -U0 ${compareTarget} -- "${filePath}"`, {
-            cwd: vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath,
-            encoding: 'utf8'
-        });
-        return diff;
-    } catch (error) {
-        console.error('Git diff error:', (error as Error).message);
-        return '';
+        await repository.getCommit(ref);
+        return true;
+    } catch {
+        return false;
     }
 }
 
-/**
- * Parses git diff output to extract line numbers
- */
-function parseDiff(diff: string): DiffLines {
-    const modified: number[] = [];
-    const added: number[] = [];
-    const removed: number[] = [];
-
-    const regex = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gm;
-    let match: RegExpExecArray | null;
-
-    while ((match = regex.exec(diff)) !== null) {
-        const oldCount = match[2] ? parseInt(match[2], 10) : 1;
-        const newStart = parseInt(match[3], 10);
-        const newCount = match[4] ? parseInt(match[4], 10) : 1;
-
-        if (oldCount > 0 && newCount > 0) {
-            // Modified lines
-            for (let i = newStart; i < newStart + newCount; i++) {
-                modified.push(i - 1); // VS Code uses 0-based indexing
-            }
-        } else if (newCount > 0) {
-            // Added lines
-            for (let i = newStart; i < newStart + newCount; i++) {
-                added.push(i - 1);
-            }
-        } else if (oldCount > 0) {
-            // Removed lines - add a red underscore at the deletion point
-            removed.push(Math.max(0, newStart - 1));
-        }
+/** Whether a path, relative to the repository root, exists at a ref. */
+async function hasPath(repository: Repository, ref: string, relativePath: string): Promise<boolean> {
+    try {
+        await repository.getObjectDetails(ref, relativePath);
+        return true;
+    } catch {
+        return false;
     }
-
-    return { modified, added, removed };
 }
 
-/**
- * Builds a gutter icon from an SVG
- */
-function gutterIcon(svg: string): vscode.Uri {
-    return vscode.Uri.parse('data:image/svg+xml;base64,' + Buffer.from(svg).toString('base64'));
+/** The file's content at the pinned ref, for VS Code to diff the editor against. */
+async function originalResource(git: GitAPI, repository: Repository, ref: string, uri: vscode.Uri): Promise<vscode.Uri | undefined> {
+    // Only this repository's files; nested repositories and submodules get their own diff
+    if (uri.scheme !== 'file' || git.getRepository(uri)?.rootUri.toString() !== repository.rootUri.toString()) {
+        return undefined;
+    }
+    const relativePath = path.relative(repository.rootUri.fsPath, uri.fsPath).split(path.sep).join('/');
+    if (relativePath.startsWith('../') || path.isAbsolute(relativePath) || (await hasPath(repository, ref, relativePath))) {
+        return git.toGitUri(uri, ref);
+    }
+    // Tracked files that didn't exist at the ref are entirely new. Untracked and ignored
+    // files are left alone, like in Git's own diff.
+    const tracked = (await hasPath(repository, 'HEAD', relativePath))
+        || repository.state.indexChanges.some((change) => change.uri.fsPath === uri.fsPath);
+    return tracked ? uri.with({ scheme: EMPTY_SCHEME }) : undefined;
 }
 
-/**
- * Creates decoration types if they don't exist
- */
-function getDecorations(): Decorations {
-    decorations ??= {
-        modified: vscode.window.createTextEditorDecorationType({
-            overviewRulerColor: 'rgba(255, 200, 0, 0.8)',
-            overviewRulerLane: vscode.OverviewRulerLane.Left,
-            gutterIconPath: gutterIcon(`<svg width="16" height="16" xmlns="http://www.w3.org/2000/svg">
-          <rect x="0" y="0" width="5" height="16" fill="#FFC83D"/>
-        </svg>`),
-            gutterIconSize: 'contain'
-        }),
-        added: vscode.window.createTextEditorDecorationType({
-            overviewRulerColor: 'rgba(0, 200, 0, 0.8)',
-            overviewRulerLane: vscode.OverviewRulerLane.Left,
-            gutterIconPath: gutterIcon(`<svg width="16" height="16" xmlns="http://www.w3.org/2000/svg">
-          <rect x="0" y="0" width="5" height="16" fill="#4CAF50"/>
-        </svg>`),
-            gutterIconSize: 'contain'
-        }),
-        removed: vscode.window.createTextEditorDecorationType({
-            overviewRulerColor: 'rgba(200, 0, 0, 0.8)',
-            overviewRulerLane: vscode.OverviewRulerLane.Left,
-            gutterIconPath: gutterIcon(`<svg width="16" height="16" xmlns="http://www.w3.org/2000/svg">
-          <text x="8" y="12" font-family="monospace" font-size="14" font-weight="bold" text-anchor="middle" fill="#F44336">▼</text>
-        </svg>`),
-            gutterIconSize: 'contain'
-        })
+function showPinnedDiff(git: GitAPI, repository: Repository, ref: string): void {
+    const root = repository.rootUri.toString();
+    const sourceControl = vscode.scm.createSourceControl('pinned-commit', `Pinned: ${ref}`, repository.rootUri);
+    sourceControl.inputBox.visible = false;
+    sourceControl.quickDiffProvider = {
+        provideOriginalResource: (uri) => originalResource(git, repository, ref, uri),
     };
-    return decorations;
+    pinnedDiffs.get(root)?.dispose();
+    pinnedDiffs.set(root, sourceControl);
 }
 
-/**
- * Highlights differences in the current editor
- */
-function highlightDiff(editor: vscode.TextEditor | undefined): void {
-    if (!editor || !editor.document) {
-        return;
+function clearPinnedDiffs(): void {
+    for (const sourceControl of pinnedDiffs.values()) {
+        sourceControl.dispose();
     }
-
-    // Clear existing decorations
-    if (decorations) {
-        editor.setDecorations(decorations.modified, []);
-        editor.setDecorations(decorations.added, []);
-        editor.setDecorations(decorations.removed, []);
-    }
-
-    const filePath = editor.document.uri.fsPath;
-    const diff = getGitDiff(filePath);
-
-    if (!diff) {
-        return;
-    }
-
-    const { modified, added, removed } = parseDiff(diff);
-
-    const { modified: modifiedDecoration, added: addedDecoration, removed: removedDecoration } = getDecorations();
-
-    const toRange = (line: number): vscode.Range | null => {
-        if (line >= 0 && line < editor.document.lineCount) {
-            return new vscode.Range(line, 0, line, editor.document.lineAt(line).text.length);
-        }
-        return null;
-    };
-    const isRange = (range: vscode.Range | null): range is vscode.Range => range !== null;
-
-    editor.setDecorations(modifiedDecoration, modified.map(toRange).filter(isRange));
-    editor.setDecorations(addedDecoration, added.map(toRange).filter(isRange));
-    editor.setDecorations(removedDecoration, removed.map(toRange).filter(isRange));
+    pinnedDiffs.clear();
 }
 
-/**
- * Creates or updates the status bar item
- */
 function updateStatusBar(): void {
-    if (!statusBarItem) {
-        statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-        statusBarItem.command = 'pinned-commit-highlighter.togglePinnedCommit';
-        statusBarItem.show();
-    }
-
-    if (pinnedCommitSha) {
-        const displayRef = pinnedCommitSha.length > 10 ? pinnedCommitSha.substring(0, 7) : pinnedCommitSha;
+    if (pinnedRef) {
+        const displayRef = pinnedRef.length > 10 ? pinnedRef.substring(0, 7) : pinnedRef;
         statusBarItem.text = `📌 ${displayRef}`;
-        statusBarItem.tooltip = `Pinned reference: ${pinnedCommitSha}. Click to change or clear.`;
+        statusBarItem.tooltip = `Pinned reference: ${pinnedRef}. Click to change or clear.`;
     } else {
         statusBarItem.text = `📌 Pin Reference`;
         statusBarItem.tooltip = `Click to pin a commit SHA, branch, or remote reference for highlighting changes`;
     }
 }
 
-/**
- * Command: Toggle pinned reference
- */
-async function togglePinnedCommit(): Promise<void> {
-    if (pinnedCommitSha) {
-        const displayRef = pinnedCommitSha.length > 10 ? pinnedCommitSha.substring(0, 7) + '...' : pinnedCommitSha;
-        const choice = await vscode.window.showQuickPick(
-            ['Change pinned reference', 'Clear pinned reference'],
-            {
-                placeHolder: `Current pinned reference: ${displayRef}`
-            }
-        );
-
-        if (choice === 'Clear pinned reference') {
-            pinnedCommitSha = null;
-            vscode.window.showInformationMessage('Pinned reference cleared. Now comparing against HEAD.');
-        } else if (choice === 'Change pinned reference') {
-            const newRef = await vscode.window.showInputBox({
-                prompt: 'Enter git reference to pin',
-                placeHolder: 'e.g., main, origin/develop, a1b2c3d, HEAD~2',
-                value: pinnedCommitSha
-            });
-
-            if (newRef && newRef.trim()) {
-                const trimmedRef = newRef.trim();
-                // Validate the reference
-                try {
-                    execSync(`git rev-parse --verify ${trimmedRef}`, {
-                        cwd: vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath,
-                        encoding: 'utf8'
-                    });
-                    pinnedCommitSha = trimmedRef;
-                    const displayRef = trimmedRef.length > 10 ? trimmedRef.substring(0, 7) + '...' : trimmedRef;
-                    vscode.window.showInformationMessage(`Pinned reference updated to: ${displayRef}`);
-                } catch {
-                    vscode.window.showErrorMessage(`Invalid git reference: ${trimmedRef}`);
-                }
-            }
-        }
-    } else {
-        const newRef = await vscode.window.showInputBox({
-            prompt: 'Enter git reference to pin',
-            placeHolder: 'e.g., main, origin/develop, a1b2c3d, HEAD~2'
-        });
-
-        if (newRef && newRef.trim()) {
-            const trimmedRef = newRef.trim();
-            // Validate the reference
-            try {
-                execSync(`git rev-parse --verify ${trimmedRef}`, {
-                    cwd: vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath,
-                    encoding: 'utf8'
-                });
-                pinnedCommitSha = trimmedRef;
-                const displayRef = trimmedRef.length > 10 ? trimmedRef.substring(0, 7) + '...' : trimmedRef;
-                vscode.window.showInformationMessage(`Reference pinned: ${displayRef}`);
-            } catch {
-                vscode.window.showErrorMessage(`Invalid git reference: ${trimmedRef}`);
-            }
-        }
+/** Pins a ref in every open repository that has it. Returns false if none do. */
+async function pin(git: GitAPI, ref: string): Promise<boolean> {
+    // A ref starting with "-" would be read by git as an option
+    const repositories = ref.startsWith('-')
+        ? []
+        : (await Promise.all(git.repositories.map(async (r) => ((await hasRef(r, ref)) ? r : undefined))))
+            .filter((r): r is Repository => r !== undefined);
+    if (repositories.length === 0) {
+        vscode.window.showErrorMessage(`Invalid git reference: ${ref}`);
+        return false;
     }
-
+    clearPinnedDiffs();
+    pinnedRef = ref;
+    for (const repository of repositories) {
+        showPinnedDiff(git, repository, ref);
+    }
     updateStatusBar();
-
-    // Refresh highlighting for current editor
-    if (vscode.window.activeTextEditor) {
-        highlightDiff(vscode.window.activeTextEditor);
-    }
+    return true;
 }
 
-/**
- * Activate extension
- */
-export function activate(context: vscode.ExtensionContext): void {
-    // Register command
-    const toggleCmd = vscode.commands.registerCommand(
-        'pinned-commit-highlighter.togglePinnedCommit',
-        togglePinnedCommit
+function unpin(): void {
+    clearPinnedDiffs();
+    pinnedRef = undefined;
+    updateStatusBar();
+}
+
+async function promptForRef(git: GitAPI, value?: string): Promise<string | undefined> {
+    const input = await vscode.window.showInputBox({
+        prompt: 'Enter git reference to pin',
+        placeHolder: REF_PLACEHOLDER,
+        value,
+    });
+    const ref = input?.trim();
+    return ref && (await pin(git, ref)) ? ref : undefined;
+}
+
+async function togglePinnedRef(): Promise<void> {
+    const git = await getGitAPI();
+    if (!git) {
+        vscode.window.showErrorMessage('The built-in Git extension is disabled.');
+        return;
+    }
+    if (git.repositories.length === 0) {
+        vscode.window.showErrorMessage('Open a folder inside a Git repository to pin a reference.');
+        return;
+    }
+
+    if (!pinnedRef) {
+        const ref = await promptForRef(git);
+        if (ref) {
+            vscode.window.showInformationMessage(`Reference pinned: ${ref}`);
+        }
+        return;
+    }
+
+    const choice = await vscode.window.showQuickPick(
+        ['Change pinned reference', 'Clear pinned reference'],
+        { placeHolder: `Current pinned reference: ${pinnedRef}` }
     );
-    context.subscriptions.push(toggleCmd);
+    if (choice === 'Clear pinned reference') {
+        unpin();
+        vscode.window.showInformationMessage('Pinned reference cleared.');
+    } else if (choice === 'Change pinned reference') {
+        const ref = await promptForRef(git, pinnedRef);
+        if (ref) {
+            vscode.window.showInformationMessage(`Pinned reference updated to: ${ref}`);
+        }
+    }
+}
 
-    // Set up event listeners
-    const onEditorChange = vscode.window.onDidChangeActiveTextEditor((editor) => {
-        highlightDiff(editor);
-    });
-
-    const onDocumentSave = vscode.workspace.onDidSaveTextDocument(() => {
-        highlightDiff(vscode.window.activeTextEditor);
-    });
-
-    context.subscriptions.push(onEditorChange, onDocumentSave);
-
-    // Initialize status bar
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
+    statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+    statusBarItem.command = TOGGLE_COMMAND;
     updateStatusBar();
+    statusBarItem.show();
 
-    // Highlight current editor if available
-    if (vscode.window.activeTextEditor) {
-        highlightDiff(vscode.window.activeTextEditor);
+    context.subscriptions.push(
+        statusBarItem,
+        vscode.commands.registerCommand(TOGGLE_COMMAND, togglePinnedRef),
+        vscode.workspace.registerTextDocumentContentProvider(EMPTY_SCHEME, { provideTextDocumentContent: () => '' }),
+        { dispose: clearPinnedDiffs },
+    );
+
+    const git = await getGitAPI();
+    if (!git) {
+        return;
     }
+    context.subscriptions.push(
+        // Repositories can open after the ref was pinned, e.g. while VS Code is still scanning the workspace
+        git.onDidOpenRepository(async (repository) => {
+            const ref = pinnedRef;
+            if (ref && !ref.startsWith('-') && (await hasRef(repository, ref)) && pinnedRef === ref) {
+                showPinnedDiff(git, repository, ref);
+            }
+        }),
+        git.onDidCloseRepository((repository) => {
+            const root = repository.rootUri.toString();
+            pinnedDiffs.get(root)?.dispose();
+            pinnedDiffs.delete(root);
+        }),
+    );
 }
 
-/**
- * Deactivate extension
- */
-export function deactivate(): void {
-    statusBarItem?.dispose();
-    if (decorations) {
-        decorations.modified.dispose();
-        decorations.added.dispose();
-        decorations.removed.dispose();
-    }
-}
+export function deactivate(): void {}
