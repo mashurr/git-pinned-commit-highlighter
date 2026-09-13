@@ -1,9 +1,8 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { Status, type API as GitAPI, type Change, type GitExtension, type Repository } from './git';
+import { RefType, Status, type API as GitAPI, type Change, type GitExtension, type Repository } from './git';
 
-const TOGGLE_COMMAND = 'pinned-commit-highlighter.togglePinnedCommit';
-const REF_PLACEHOLDER = 'e.g., main, origin/develop, a1b2c3d, HEAD~2';
+const PIN_COMMAND = 'pinned-commit-highlighter.togglePinnedCommit';
 // Empty documents that files added since the pinned ref are compared against
 const EMPTY_SCHEME = 'pinned-commit-empty';
 
@@ -210,7 +209,7 @@ function updateStatusBar(): void {
         statusBarItem.tooltip = `Pinned reference: ${pinnedRef}. Click to change or clear.`;
     } else {
         statusBarItem.text = `📌 Pin Reference`;
-        statusBarItem.tooltip = `Click to pin a commit SHA, branch, or remote reference for highlighting changes`;
+        statusBarItem.tooltip = `Click to pin a branch, tag or commit and see the changes since it`;
     }
 }
 
@@ -240,17 +239,80 @@ function unpin(): void {
     updateStatusBar();
 }
 
-async function promptForRef(git: GitAPI, value?: string): Promise<string | undefined> {
-    const input = await vscode.window.showInputBox({
-        prompt: 'Enter git reference to pin',
-        placeHolder: REF_PLACEHOLDER,
-        value,
-    });
-    const ref = input?.trim();
-    return ref && (await pin(git, ref)) ? ref : undefined;
+/** An entry in the ref picker: a ref to pin, or the clear action. */
+interface RefItem extends vscode.QuickPickItem {
+    ref?: string;
+    clear?: boolean;
 }
 
-async function togglePinnedRef(): Promise<void> {
+/** Branches, remote branches and tags from every open repository, most recent first, under separators. */
+async function refItems(git: GitAPI): Promise<RefItem[]> {
+    const refs = (await Promise.all(git.repositories.map((r) => r.getRefs({ sort: 'committerdate' }).catch(() => [])))).flat();
+    const sections: [type: RefType, title: string, icon: string][] = [
+        [RefType.Head, 'Branches', 'git-branch'],
+        [RefType.RemoteHead, 'Remote branches', 'cloud'],
+        [RefType.Tag, 'Tags', 'tag'],
+    ];
+    const items: RefItem[] = [];
+    for (const [type, title, icon] of sections) {
+        const commits = new Map<string, string | undefined>();
+        for (const ref of refs) {
+            // A remote's HEAD only points at one of its branches
+            if (ref.type === type && ref.name && !ref.name.endsWith('/HEAD') && !commits.has(ref.name)) {
+                commits.set(ref.name, ref.commit);
+            }
+        }
+        if (commits.size > 0) {
+            items.push({ label: title, kind: vscode.QuickPickItemKind.Separator });
+            for (const [name, commit] of commits) {
+                items.push({ label: `$(${icon}) ${name}`, description: commit?.substring(0, 7), ref: name });
+            }
+        }
+    }
+    return items;
+}
+
+/** Lets the user search branches and tags, type any other ref or commit, or clear the pin. */
+async function pickRef(git: GitAPI): Promise<void> {
+    const quickPick = vscode.window.createQuickPick<RefItem>();
+    quickPick.placeholder = pinnedRef
+        ? `Pinned: ${pinnedRef}. Pick a branch or tag, or type any commit or ref`
+        : 'Pick a branch or tag, or type any commit or ref (e.g. a1b2c3d, HEAD~2)';
+    const clear: RefItem[] = pinnedRef ? [{ label: '$(close) Clear pinned reference', clear: true }] : [];
+    let refs: RefItem[] = [];
+    const render = () => {
+        const value = quickPick.value.trim();
+        // Commits aren't listed, so whatever is typed can be pinned as is. The label doesn't start with
+        // the typed text, so branches and tags that do start with it are ranked first.
+        const typed: RefItem[] = value && !refs.some((item) => item.ref === value)
+            ? [{ label: `$(git-commit) Pin "${value}"`, description: 'commit or ref', ref: value, alwaysShow: true }]
+            : [];
+        quickPick.items = [...typed, ...clear, ...refs];
+    };
+    const picked = new Promise<RefItem | undefined>((resolve) => {
+        quickPick.onDidAccept(() => resolve(quickPick.selectedItems[0]));
+        quickPick.onDidHide(() => resolve(undefined));
+    });
+    quickPick.onDidChangeValue(render);
+    quickPick.busy = true;
+    render();
+    quickPick.show();
+    refItems(git).then((items) => {
+        refs = items;
+        quickPick.busy = false;
+        render();
+    });
+
+    const item = await picked;
+    quickPick.dispose();
+    if (item?.clear) {
+        unpin();
+    } else if (item?.ref) {
+        await pin(git, item.ref);
+    }
+}
+
+async function choosePinnedRef(): Promise<void> {
     const git = await getGitAPI();
     if (!git) {
         vscode.window.showErrorMessage('The built-in Git extension is disabled.');
@@ -260,39 +322,18 @@ async function togglePinnedRef(): Promise<void> {
         vscode.window.showErrorMessage('Open a folder inside a Git repository to pin a reference.');
         return;
     }
-
-    if (!pinnedRef) {
-        const ref = await promptForRef(git);
-        if (ref) {
-            vscode.window.showInformationMessage(`Reference pinned: ${ref}`);
-        }
-        return;
-    }
-
-    const choice = await vscode.window.showQuickPick(
-        ['Change pinned reference', 'Clear pinned reference'],
-        { placeHolder: `Current pinned reference: ${pinnedRef}` }
-    );
-    if (choice === 'Clear pinned reference') {
-        unpin();
-        vscode.window.showInformationMessage('Pinned reference cleared.');
-    } else if (choice === 'Change pinned reference') {
-        const ref = await promptForRef(git, pinnedRef);
-        if (ref) {
-            vscode.window.showInformationMessage(`Pinned reference updated to: ${ref}`);
-        }
-    }
+    await pickRef(git);
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-    statusBarItem.command = TOGGLE_COMMAND;
+    statusBarItem.command = PIN_COMMAND;
     updateStatusBar();
     statusBarItem.show();
 
     context.subscriptions.push(
         statusBarItem,
-        vscode.commands.registerCommand(TOGGLE_COMMAND, togglePinnedRef),
+        vscode.commands.registerCommand(PIN_COMMAND, choosePinnedRef),
         vscode.workspace.registerTextDocumentContentProvider(EMPTY_SCHEME, { provideTextDocumentContent: () => '' }),
         { dispose: clearPinnedDiffs },
     );

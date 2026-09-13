@@ -6,6 +6,22 @@ export interface Commit {
     readonly hash: string;
 }
 
+export const enum RefType {
+    Head,
+    RemoteHead,
+    Tag,
+}
+
+export interface Ref {
+    readonly type: RefType;
+    readonly name?: string;
+    readonly commit?: string;
+}
+
+export interface RefQuery {
+    readonly sort?: 'alphabetically' | 'committerdate';
+}
+
 export const enum Status {
     INDEX_MODIFIED,
     INDEX_ADDED,
@@ -34,6 +50,7 @@ export interface Repository {
     getCommit(ref: string): Promise<Commit>;
     getObjectDetails(treeish: string, path: string): Promise<{ mode: string; object: string; size: number }>;
     diffWith(ref: string): Promise<Change[]>;
+    getRefs(query: RefQuery): Promise<Ref[]>;
 }
 
 export interface API {
