@@ -21,6 +21,8 @@ Pin any branch, tag or commit and see everything that changed since it, right in
 
 ## Known Issues
 
+**Note: Git's own change bars and the pinned change bars share the gutter and look the same. A line you edited back to how it was at the pinned ref still shows Git's bar, and clicking a bar may open Git's diff first (switch with the dropdown in the diff peek). In recent VS Code versions you can right-click a change bar and turn off Git to see only pinned changes; turn it back on after unpinning. The changed files list in Source Control always shows only pinned changes.**
+
 - The pinned ref resets when the window reloads.
 - In the gutter, a file renamed since the ref shows as entirely new.
 
