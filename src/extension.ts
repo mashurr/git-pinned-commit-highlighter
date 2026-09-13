@@ -5,6 +5,8 @@ import { RefType, Status, type API as GitAPI, type Change, type Commit, type Git
 const PIN_COMMAND = 'pinned-commit-highlighter.togglePinnedCommit';
 // Empty documents that files added since the pinned ref are compared against
 const EMPTY_SCHEME = 'pinned-commit-empty';
+// Git's empty tree: what a submodule that didn't exist at the pinned ref is compared against, so all its files show as new
+const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 // The picker lists this many entries per section; typing searches the rest
 const SHOWN_PER_SECTION = 5;
 
@@ -28,13 +30,32 @@ function displayRef(ref: string): string {
     return /^[0-9a-f]{40}$/i.test(ref) ? ref.substring(0, 7) : ref;
 }
 
-async function hasRef(repository: Repository, ref: string): Promise<boolean> {
-    try {
-        await repository.getCommit(ref);
-        return true;
-    } catch {
-        return false;
+/** The open repository that has this one as a submodule, and the submodule's path in it. */
+function parentOf(git: GitAPI, repository: Repository): { parent: Repository; path: string } | undefined {
+    for (const parent of git.repositories) {
+        const submodule = parent.state.submodules.find((s) => path.join(parent.rootUri.fsPath, s.path) === repository.rootUri.fsPath);
+        if (submodule) {
+            return { parent, path: submodule.path };
+        }
     }
+    return undefined;
+}
+
+/**
+ * What a repository is compared against when a ref is pinned, or undefined if it isn't. A submodule uses the
+ * commit its parent recorded for it at the parent's pinned commit, one level at a time; other repositories use the ref.
+ */
+async function pinnedTarget(git: GitAPI, repository: Repository, ref: string): Promise<string | undefined> {
+    const owner = parentOf(git, repository);
+    if (!owner) {
+        return (await repository.getCommit(ref).catch(() => undefined))?.hash;
+    }
+    const parentTarget = await pinnedTarget(git, owner.parent, ref);
+    if (!parentTarget) {
+        return undefined;
+    }
+    const recorded = await owner.parent.getObjectDetails(parentTarget, owner.path).catch(() => undefined);
+    return recorded?.mode === '160000' ? recorded.object : EMPTY_TREE;
 }
 
 /** Whether a path, relative to the repository root, exists at a ref. */
@@ -122,7 +143,7 @@ function serialize(task: () => Promise<void>): () => Promise<void> {
 /**
  * Shows one repository's changes since the pinned ref: VS Code's quick diff in the gutter, drawn like
  * Git's own changes so it never takes the breakpoint column, and a "Changes since" list in Source Control.
- * Both are tied to the commit the ref points at, and rebuilt when the ref moves to another commit.
+ * Both are tied to the commit the repository is compared against, and rebuilt when that commit changes.
  */
 function showPinnedDiff(git: GitAPI, repository: Repository, ref: string): void {
     const root = repository.rootUri.toString();
@@ -130,7 +151,7 @@ function showPinnedDiff(git: GitAPI, repository: Repository, ref: string): void 
     let shown: { commit: string; sourceControl: vscode.SourceControl; changes: vscode.SourceControlResourceGroup } | undefined;
 
     const update = serialize(async () => {
-        const commit = (await repository.getCommit(ref).catch(() => undefined))?.hash;
+        const commit = await pinnedTarget(git, repository, ref);
         // A ref deleted while pinned keeps showing its last commit
         if (disposed || !commit) {
             return;
@@ -150,27 +171,37 @@ function showPinnedDiff(git: GitAPI, repository: Repository, ref: string): void 
         const { changes } = shown;
         const files = await repository.diffWith(commit).catch(() => undefined);
         if (files && !disposed) {
+            // A submodule's files are listed under its own row, not as a single entry here
+            const submodules = new Set(repository.state.submodules.map((s) => path.join(repository.rootUri.fsPath, s.path)));
             changes.resourceStates = files
+                .filter((change) => !submodules.has(change.uri.fsPath))
                 .map((change) => changedFile(git, ref, commit, change))
                 .sort((a, b) => a.resourceUri.fsPath.localeCompare(b.resourceUri.fsPath));
         }
     });
 
-    const listeners: vscode.Disposable[] = [repository.state.onDidChange(update)];
+    // A submodule's commit also changes when its parents' refs or recorded submodule commits do
+    const watched = [repository];
+    for (let owner = parentOf(git, repository); owner; owner = parentOf(git, owner.parent)) {
+        watched.push(owner.parent);
+    }
+    const listeners: vscode.Disposable[] = watched.map((r) => r.state.onDidChange(update));
     // Git's state doesn't change when only a branch or tag moves (e.g. `git fetch`), so watch the refs too
-    refFolders(repository.rootUri).then((folders) => {
-        for (const folder of folders) {
-            const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folder, '{HEAD,packed-refs,refs/**}'));
-            watcher.onDidChange(update);
-            watcher.onDidCreate(update);
-            watcher.onDidDelete(update);
-            if (disposed) {
-                watcher.dispose();
-            } else {
-                listeners.push(watcher);
+    for (const watchedRepository of watched) {
+        refFolders(watchedRepository.rootUri).then((folders) => {
+            for (const folder of folders) {
+                const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folder, '{HEAD,packed-refs,refs/**}'));
+                watcher.onDidChange(update);
+                watcher.onDidCreate(update);
+                watcher.onDidDelete(update);
+                if (disposed) {
+                    watcher.dispose();
+                } else {
+                    listeners.push(watcher);
+                }
             }
-        }
-    });
+        });
+    }
     update();
 
     pinnedDiffs.get(root)?.dispose();
@@ -219,12 +250,12 @@ function updateStatusBar(): void {
     }
 }
 
-/** Pins a ref in every open repository that has it. Returns false if none do. */
+/** Pins a ref in every open repository it applies to. Returns false if it applies to none. */
 async function pin(git: GitAPI, ref: string): Promise<boolean> {
     // A ref starting with "-" would be read by git as an option
     const repositories = ref.startsWith('-')
         ? []
-        : (await Promise.all(git.repositories.map(async (r) => ((await hasRef(r, ref)) ? r : undefined))))
+        : (await Promise.all(git.repositories.map(async (r) => ((await pinnedTarget(git, r, ref)) ? r : undefined))))
             .filter((r): r is Repository => r !== undefined);
     if (repositories.length === 0) {
         vscode.window.showErrorMessage(`Invalid git reference: ${ref}`);
@@ -256,9 +287,9 @@ interface Section {
     items: RefItem[];
 }
 
-/** Branches, remote branches and tags from every open repository, most recent first, each once. */
-async function refSections(git: GitAPI): Promise<Section[]> {
-    const refs = (await Promise.all(git.repositories.map((r) => r.getRefs({ sort: 'committerdate' }).catch(() => [])))).flat();
+/** Branches, remote branches and tags from the given repositories, most recent first, each once. */
+async function refSections(repositories: Repository[]): Promise<Section[]> {
+    const refs = (await Promise.all(repositories.map((r) => r.getRefs({ sort: 'committerdate' }).catch(() => [])))).flat();
     const sections: [type: RefType, title: string, icon: string][] = [
         [RefType.Head, 'Branches', 'git-branch'],
         [RefType.RemoteHead, 'Remote branches', 'cloud'],
@@ -283,9 +314,9 @@ function commitItem(commit: Commit): RefItem {
     return { label: `$(git-commit) ${commit.hash.substring(0, 7)}`, description: commit.message.split('\n')[0], ref: commit.hash };
 }
 
-/** The latest commits of every open repository, newest first, each once. */
-async function latestCommits(git: GitAPI): Promise<RefItem[]> {
-    const commits = (await Promise.all(git.repositories.map((r) => r.log({ maxEntries: SHOWN_PER_SECTION }).catch(() => [])))).flat();
+/** The latest commits of the given repositories, newest first, each once. */
+async function latestCommits(repositories: Repository[]): Promise<RefItem[]> {
+    const commits = (await Promise.all(repositories.map((r) => r.log({ maxEntries: SHOWN_PER_SECTION }).catch(() => [])))).flat();
     const time = (commit: Commit) => (commit.commitDate ?? commit.authorDate)?.getTime() ?? 0;
     const hashes = new Set<string>();
     return commits
@@ -299,6 +330,8 @@ async function latestCommits(git: GitAPI): Promise<RefItem[]> {
  * its most recent entries, so big repositories stay quick; typing searches branch and tag names and commit hashes.
  */
 async function pickRef(git: GitAPI): Promise<void> {
+    // Submodules follow their parent's pinned commit, so only their parents' refs and commits are offered
+    const repositories = git.repositories.filter((r) => !parentOf(git, r));
     const quickPick = vscode.window.createQuickPick<RefItem>();
     quickPick.placeholder = pinnedRef
         ? `Pinned: ${displayRef(pinnedRef)}. Search branches, tags and commits, or type any ref`
@@ -354,7 +387,7 @@ async function pickRef(git: GitAPI): Promise<void> {
         // A commit older than the ones listed is found by its hash
         const value = input.trim().toLowerCase();
         if (/^[0-9a-f]{4,40}$/.test(value) && !foundByHash?.ref?.startsWith(value)) {
-            load(Promise.all(git.repositories.map((r) => r.getCommit(value).catch(() => undefined)))).then((found) => {
+            load(Promise.all(repositories.map((r) => r.getCommit(value).catch(() => undefined)))).then((found) => {
                 const commit = found.find((c) => c !== undefined);
                 if (commit && quickPick.value.trim().toLowerCase() === value) {
                     foundByHash = commitItem(commit);
@@ -366,7 +399,7 @@ async function pickRef(git: GitAPI): Promise<void> {
 
     render();
     quickPick.show();
-    load(Promise.all([refSections(git), latestCommits(git)])).then(([sections, latest]) => {
+    load(Promise.all([refSections(repositories), latestCommits(repositories)])).then(([sections, latest]) => {
         refs = sections;
         commits = latest;
         render();
@@ -413,10 +446,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
     }
     context.subscriptions.push(
-        // Repositories can open after the ref was pinned, e.g. while VS Code is still scanning the workspace
+        // Repositories, including submodules, can open after the ref was pinned, e.g. while VS Code is still scanning
         git.onDidOpenRepository(async (repository) => {
             const ref = pinnedRef;
-            if (ref && !ref.startsWith('-') && (await hasRef(repository, ref)) && pinnedRef === ref) {
+            if (ref && !ref.startsWith('-') && (await pinnedTarget(git, repository, ref)) && pinnedRef === ref) {
                 showPinnedDiff(git, repository, ref);
             }
         }),
