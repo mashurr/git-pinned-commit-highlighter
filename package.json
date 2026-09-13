@@ -1,8 +1,8 @@
 {
   "name": "git-pinned-commit-highlighter",
-  "displayName": "Git Pinned Commit Highlighter",
-  "description": "Highlights file changes compared to a pinned Git commit directly in the editor.",
-  "version": "0.0.1",
+  "displayName": "Git Pinned Diff",
+  "description": "Pin a branch, tag or commit and see every change since it in the gutter and the Source Control view.",
+  "version": "0.1.0",
   "publisher": "mashurr",
   "icon": "icon.png",
     "repository": {
@@ -13,7 +13,18 @@
     "vscode": "^1.90.0"
   },
   "categories": [
+    "SCM Providers",
     "Other"
+  ],
+  "keywords": [
+    "git",
+    "diff",
+    "compare",
+    "branch",
+    "commit",
+    "tag",
+    "gutter",
+    "quick diff"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -23,7 +34,7 @@
     "commands": [
       {
         "command": "pinned-commit-highlighter.togglePinnedCommit",
-        "title": "Toggle Pinned Commit"
+        "title": "Git Pinned Diff: Pin a Branch, Tag or Commit"
       }
     ]
   },
