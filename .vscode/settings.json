@@ -1,0 +1,6 @@
+{
+	"search.exclude": {
+		"out": true
+	},
+	"js/ts.tsc.autoDetect": "off"
+}
