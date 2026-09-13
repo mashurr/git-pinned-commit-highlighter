@@ -6,12 +6,26 @@ export interface Commit {
     readonly hash: string;
 }
 
+export const enum Status {
+    INDEX_MODIFIED,
+    INDEX_ADDED,
+    INDEX_DELETED,
+    INDEX_RENAMED,
+    INDEX_COPIED,
+
+    MODIFIED,
+    DELETED,
+}
+
 export interface Change {
     readonly uri: Uri;
+    readonly originalUri: Uri;
+    readonly status: Status;
 }
 
 export interface RepositoryState {
     readonly indexChanges: Change[];
+    readonly onDidChange: Event<void>;
 }
 
 export interface Repository {
@@ -19,6 +33,7 @@ export interface Repository {
     readonly state: RepositoryState;
     getCommit(ref: string): Promise<Commit>;
     getObjectDetails(treeish: string, path: string): Promise<{ mode: string; object: string; size: number }>;
+    diffWith(ref: string): Promise<Change[]>;
 }
 
 export interface API {

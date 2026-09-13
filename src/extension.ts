@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import type { API as GitAPI, GitExtension, Repository } from './git';
+import { Status, type API as GitAPI, type Change, type GitExtension, type Repository } from './git';
 
 const TOGGLE_COMMAND = 'pinned-commit-highlighter.togglePinnedCommit';
 const REF_PLACEHOLDER = 'e.g., main, origin/develop, a1b2c3d, HEAD~2';
@@ -9,9 +9,8 @@ const EMPTY_SCHEME = 'pinned-commit-empty';
 
 let pinnedRef: string | undefined;
 let statusBarItem: vscode.StatusBarItem;
-// One source control per repository root. VS Code draws each one's quick diff in the
-// gutter the same way as Git's own changes, so it never takes the breakpoint column.
-const pinnedDiffs = new Map<string, vscode.SourceControl>();
+// What is shown for the pinned ref, per repository root
+const pinnedDiffs = new Map<string, vscode.Disposable>();
 
 /** The built-in Git extension's API, or undefined when it is disabled. */
 async function getGitAPI(): Promise<GitAPI | undefined> {
@@ -42,15 +41,15 @@ async function hasPath(repository: Repository, ref: string, relativePath: string
     }
 }
 
-/** The file's content at the pinned ref, for VS Code to diff the editor against. */
-async function originalResource(git: GitAPI, repository: Repository, ref: string, uri: vscode.Uri): Promise<vscode.Uri | undefined> {
+/** The file's content at the pinned commit, for VS Code to diff the editor against. */
+async function originalResource(git: GitAPI, repository: Repository, commit: string, uri: vscode.Uri): Promise<vscode.Uri | undefined> {
     // Only this repository's files; nested repositories and submodules get their own diff
     if (uri.scheme !== 'file' || git.getRepository(uri)?.rootUri.toString() !== repository.rootUri.toString()) {
         return undefined;
     }
     const relativePath = path.relative(repository.rootUri.fsPath, uri.fsPath).split(path.sep).join('/');
-    if (relativePath.startsWith('../') || path.isAbsolute(relativePath) || (await hasPath(repository, ref, relativePath))) {
-        return git.toGitUri(uri, ref);
+    if (relativePath.startsWith('../') || path.isAbsolute(relativePath) || (await hasPath(repository, commit, relativePath))) {
+        return git.toGitUri(uri, commit);
     }
     // Tracked files that didn't exist at the ref are entirely new. Untracked and ignored
     // files are left alone, like in Git's own diff.
@@ -59,20 +58,147 @@ async function originalResource(git: GitAPI, repository: Repository, ref: string
     return tracked ? uri.with({ scheme: EMPTY_SCHEME }) : undefined;
 }
 
+/** A row in the Source Control view for a file changed since the ref; clicking it opens the diff. */
+function changedFile(git: GitAPI, ref: string, commit: string, change: Change): vscode.SourceControlResourceState {
+    const uri = change.uri;
+    const empty = (file: vscode.Uri) => file.with({ scheme: EMPTY_SCHEME });
+    let original = git.toGitUri(uri, commit);
+    let modified = uri;
+    let label = 'Modified';
+    let icon = 'diff-modified';
+    let color = 'gitDecoration.modifiedResourceForeground';
+    if (change.status === Status.INDEX_ADDED) {
+        original = empty(uri);
+        [label, icon, color] = ['Added', 'diff-added', 'gitDecoration.addedResourceForeground'];
+    } else if (change.status === Status.DELETED) {
+        modified = empty(uri);
+        [label, icon, color] = ['Deleted', 'diff-removed', 'gitDecoration.deletedResourceForeground'];
+    } else if (change.status === Status.INDEX_RENAMED) {
+        original = git.toGitUri(change.originalUri, commit);
+        [label, icon, color] = [`Renamed from ${path.basename(change.originalUri.fsPath)}`, 'diff-renamed', 'gitDecoration.renamedResourceForeground'];
+    }
+    return {
+        resourceUri: uri,
+        decorations: {
+            tooltip: `${label} since ${ref}`,
+            strikeThrough: change.status === Status.DELETED,
+            iconPath: new vscode.ThemeIcon(icon, new vscode.ThemeColor(color)),
+        },
+        command: {
+            command: 'vscode.diff',
+            title: 'Open Changes',
+            arguments: [original, modified, `${path.basename(uri.fsPath)} (since ${ref})`],
+        },
+    };
+}
+
+/** Runs a task one at a time; calls made while it runs make it run once more afterwards. */
+function serialize(task: () => Promise<void>): () => Promise<void> {
+    let running = false;
+    let again = false;
+    return async () => {
+        if (running) {
+            again = true;
+            return;
+        }
+        running = true;
+        try {
+            do {
+                again = false;
+                await task();
+            } while (again);
+        } finally {
+            running = false;
+        }
+    };
+}
+
+/**
+ * Shows one repository's changes since the pinned ref: VS Code's quick diff in the gutter, drawn like
+ * Git's own changes so it never takes the breakpoint column, and a "Changes since" list in Source Control.
+ * Both are tied to the commit the ref points at, and rebuilt when the ref moves to another commit.
+ */
 function showPinnedDiff(git: GitAPI, repository: Repository, ref: string): void {
     const root = repository.rootUri.toString();
-    const sourceControl = vscode.scm.createSourceControl('pinned-commit', `Pinned: ${ref}`, repository.rootUri);
-    sourceControl.inputBox.visible = false;
-    sourceControl.quickDiffProvider = {
-        provideOriginalResource: (uri) => originalResource(git, repository, ref, uri),
-    };
+    let disposed = false;
+    let shown: { commit: string; sourceControl: vscode.SourceControl; changes: vscode.SourceControlResourceGroup } | undefined;
+
+    const update = serialize(async () => {
+        const commit = (await repository.getCommit(ref).catch(() => undefined))?.hash;
+        // A ref deleted while pinned keeps showing its last commit
+        if (disposed || !commit) {
+            return;
+        }
+        if (shown?.commit !== commit) {
+            // VS Code only asks for a file's original content again when the quick diff provider changes
+            shown?.sourceControl.dispose();
+            const sourceControl = vscode.scm.createSourceControl('pinned-commit', `Pinned: ${ref}`, repository.rootUri);
+            sourceControl.inputBox.visible = false;
+            // Changes since the ref aren't pending commits, so they stay out of the Source Control badge
+            sourceControl.count = 0;
+            sourceControl.quickDiffProvider = {
+                provideOriginalResource: (uri) => originalResource(git, repository, commit, uri),
+            };
+            shown = { commit, sourceControl, changes: sourceControl.createResourceGroup('changes', `Changes since ${ref}`) };
+        }
+        const { changes } = shown;
+        const files = await repository.diffWith(commit).catch(() => undefined);
+        if (files && !disposed) {
+            changes.resourceStates = files
+                .map((change) => changedFile(git, ref, commit, change))
+                .sort((a, b) => a.resourceUri.fsPath.localeCompare(b.resourceUri.fsPath));
+        }
+    });
+
+    const listeners: vscode.Disposable[] = [repository.state.onDidChange(update)];
+    // Git's state doesn't change when only a branch or tag moves (e.g. `git fetch`), so watch the refs too
+    refFolders(repository.rootUri).then((folders) => {
+        for (const folder of folders) {
+            const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folder, '{HEAD,packed-refs,refs/**}'));
+            watcher.onDidChange(update);
+            watcher.onDidCreate(update);
+            watcher.onDidDelete(update);
+            if (disposed) {
+                watcher.dispose();
+            } else {
+                listeners.push(watcher);
+            }
+        }
+    });
+    update();
+
     pinnedDiffs.get(root)?.dispose();
-    pinnedDiffs.set(root, sourceControl);
+    pinnedDiffs.set(root, {
+        dispose: () => {
+            disposed = true;
+            listeners.forEach((listener) => listener.dispose());
+            shown?.sourceControl.dispose();
+        },
+    });
+}
+
+/** Folders holding a repository's refs: its git folder and, for worktrees, the shared one with branches and tags. */
+async function refFolders(root: vscode.Uri): Promise<vscode.Uri[]> {
+    const read = async (uri: vscode.Uri) => Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8').trim();
+    const dotGit = vscode.Uri.joinPath(root, '.git');
+    try {
+        // Worktrees and submodules have a .git file pointing at their git folder
+        const gitDir = (await vscode.workspace.fs.stat(dotGit)).type === vscode.FileType.File
+            ? vscode.Uri.file(path.resolve(root.fsPath, (await read(dotGit)).replace(/^gitdir:\s*/, '')))
+            : dotGit;
+        const commonDir = await read(vscode.Uri.joinPath(gitDir, 'commondir')).then(
+            (dir) => vscode.Uri.file(path.resolve(gitDir.fsPath, dir)),
+            () => undefined,
+        );
+        return commonDir ? [gitDir, commonDir] : [gitDir];
+    } catch {
+        return [];
+    }
 }
 
 function clearPinnedDiffs(): void {
-    for (const sourceControl of pinnedDiffs.values()) {
-        sourceControl.dispose();
+    for (const pinnedDiff of pinnedDiffs.values()) {
+        pinnedDiff.dispose();
     }
     pinnedDiffs.clear();
 }
