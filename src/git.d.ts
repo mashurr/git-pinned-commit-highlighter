@@ -4,6 +4,29 @@ import { Event, Uri } from 'vscode';
 
 export interface Commit {
     readonly hash: string;
+    readonly message: string;
+    readonly authorDate?: Date;
+    readonly commitDate?: Date;
+}
+
+export interface LogOptions {
+    readonly maxEntries?: number;
+}
+
+export const enum RefType {
+    Head,
+    RemoteHead,
+    Tag,
+}
+
+export interface Ref {
+    readonly type: RefType;
+    readonly name?: string;
+    readonly commit?: string;
+}
+
+export interface RefQuery {
+    readonly sort?: 'alphabetically' | 'committerdate';
 }
 
 export const enum Status {
@@ -34,6 +57,8 @@ export interface Repository {
     getCommit(ref: string): Promise<Commit>;
     getObjectDetails(treeish: string, path: string): Promise<{ mode: string; object: string; size: number }>;
     diffWith(ref: string): Promise<Change[]>;
+    getRefs(query: RefQuery): Promise<Ref[]>;
+    log(options?: LogOptions): Promise<Commit[]>;
 }
 
 export interface API {
