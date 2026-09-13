@@ -46,8 +46,13 @@ export interface Change {
     readonly status: Status;
 }
 
+export interface Submodule {
+    readonly path: string;
+}
+
 export interface RepositoryState {
     readonly indexChanges: Change[];
+    readonly submodules: Submodule[];
     readonly onDidChange: Event<void>;
 }
 
